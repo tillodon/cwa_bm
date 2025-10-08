@@ -1,0 +1,404 @@
+name: General CI - Code Quality & Security
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  schedule:
+    # Run security scans daily at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+env:
+  NODE_VERSION: '18'
+
+jobs:
+  code-quality:
+    name: Code Quality Analysis
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+
+    - name: Install Dependencies
+      run: npm ci
+
+    - name: Run ESLint
+      run: |
+        if [ -f ".eslintrc.js" ] || [ -f ".eslintrc.json" ] || [ -f "eslint.config.js" ]; then
+          npm run lint || npx eslint . --ext .js,.ts,.jsx,.tsx
+        else
+          echo "No ESLint configuration found, skipping..."
+        fi
+
+    - name: Run Prettier Check
+      run: |
+        if [ -f ".prettierrc" ] || [ -f ".prettierrc.json" ] || [ -f "prettier.config.js" ]; then
+          npx prettier --check .
+        else
+          echo "No Prettier configuration found, skipping..."
+        fi
+
+    - name: Check TypeScript
+      run: |
+        if [ -f "tsconfig.json" ]; then
+          npx tsc --noEmit
+        else
+          echo "No TypeScript configuration found, skipping..."
+        fi
+
+    - name: Run Tests
+      run: |
+        if [ -f "package.json" ] && grep -q '"test"' package.json; then
+          npm test
+        else
+          echo "No test script found, skipping..."
+        fi
+
+    - name: Generate Test Coverage
+      run: |
+        if [ -f "package.json" ] && grep -q '"test:coverage"' package.json; then
+          npm run test:coverage
+        elif [ -f "package.json" ] && grep -q 'jest' package.json; then
+          npx jest --coverage
+        else
+          echo "No coverage script available, skipping..."
+        fi
+
+    - name: Upload Coverage Reports
+      if: success()
+      uses: codecov/codecov-action@v3
+      with:
+        flags: general
+        fail_ci_if_error: false
+
+  security-analysis:
+    name: Security Analysis
+    runs-on: ubuntu-latest
+    
+    permissions:
+      security-events: write
+      contents: read
+      actions: read
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+
+    - name: Run npm audit
+      run: |
+        npm audit --audit-level=high
+        npm audit --json > npm-audit-report.json || true
+
+    - name: Upload npm audit report
+      uses: actions/upload-artifact@v3
+      with:
+        name: npm-audit-report
+        path: npm-audit-report.json
+
+    - name: Initialize CodeQL
+      uses: github/codeql-action/init@v2
+      with:
+        languages: javascript, typescript
+        queries: security-extended,security-and-quality
+
+    - name: Autobuild
+      uses: github/codeql-action/autobuild@v2
+
+    - name: Perform CodeQL Analysis
+      uses: github/codeql-action/analyze@v2
+      with:
+        category: "/language:javascript"
+
+    - name: Run Semgrep Security Scan
+      uses: returntocorp/semgrep-action@v1
+      with:
+        config: >-
+          p/security-audit
+          p/secrets
+          p/owasp-top-ten
+        publishToken: ${{ secrets.SEMGREP_APP_TOKEN }}
+        publishDeployment: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+    - name: Check for Secrets
+      uses: trufflesecurity/trufflehog@main
+      with:
+        path: ./
+        base: ${{ github.event.repository.default_branch }}
+        head: HEAD
+        extra_args: --debug --only-verified
+
+  dependency-analysis:
+    name: Dependency Analysis
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+
+    - name: Install Dependencies
+      run: npm ci
+
+    - name: Check for Outdated Dependencies
+      run: |
+        echo "📦 Checking for outdated dependencies..."
+        npm outdated || true
+        
+        # Create report
+        npm outdated --json > outdated-report.json || true
+
+    - name: License Compliance Check
+      run: |
+        echo "📄 Checking license compliance..."
+        npx license-checker --summary > license-report.txt || true
+        
+        # Check for problematic licenses
+        if npx license-checker --excludePackages "$(cat package.json | jq -r '.name')" --onlyAllow "MIT;Apache-2.0;BSD-3-Clause;BSD-2-Clause;ISC" --summary; then
+          echo "✅ All licenses are compliant"
+        else
+          echo "❌ Non-compliant licenses found"
+          exit 1
+        fi
+
+    - name: Bundle Size Analysis
+      run: |
+        echo "📊 Analyzing bundle size..."
+        if [ -f "webpack.config.js" ] || [ -f "vite.config.js" ] || [ -f "next.config.js" ]; then
+          npm run build || true
+          if [ -d "dist" ] || [ -d "build" ] || [ -d ".next" ]; then
+            du -sh dist/ build/ .next/ 2>/dev/null || true
+          fi
+        fi
+
+    - name: Upload Dependency Reports
+      uses: actions/upload-artifact@v3
+      with:
+        name: dependency-reports
+        path: |
+          outdated-report.json
+          license-report.txt
+
+  documentation-check:
+    name: Documentation Check
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Check README Exists
+      run: |
+        if [ ! -f "README.md" ]; then
+          echo "❌ README.md is missing"
+          exit 1
+        fi
+        echo "✅ README.md exists"
+
+    - name: Check Required Documentation Sections
+      run: |
+        echo "📖 Checking README sections..."
+        
+        # Check for required sections
+        REQUIRED_SECTIONS=("Installation" "Usage" "Contributing" "License" "Security")
+        
+        for section in "${REQUIRED_SECTIONS[@]}"; do
+          if grep -q -i "$section" README.md; then
+            echo "✅ $section section found"
+          else
+            echo "⚠️ $section section missing or not clearly marked"
+          fi
+        done
+
+    - name: Check Code Documentation
+      run: |
+        echo "📝 Checking code documentation..."
+        
+        # Check for JSDoc comments in TypeScript/JavaScript files
+        if find . -name "*.ts" -o -name "*.js" -o -name "*.tsx" -o -name "*.jsx" | head -10 | xargs grep -l "/\*\*" > /dev/null; then
+          echo "✅ JSDoc comments found"
+        else
+          echo "⚠️ Consider adding JSDoc comments for better documentation"
+        fi
+
+    - name: Lint Markdown Files
+      run: |
+        if command -v markdownlint &> /dev/null; then
+          markdownlint README.md docs/ || true
+        else
+          echo "ℹ️ markdownlint not available, skipping markdown linting"
+        fi
+
+    - name: Check Links in Documentation
+      uses: gaurav-nelson/github-action-markdown-link-check@v1
+      with:
+        use-quiet-mode: 'yes'
+        use-verbose-mode: 'no'
+        config-file: '.github/workflows/mlc_config.json'
+        folder-path: 'docs/'
+        file-path: './README.md'
+        max-depth: 2
+      continue-on-error: true
+
+  performance-baseline:
+    name: Performance Baseline
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+
+    - name: Install Dependencies
+      run: npm ci
+
+    - name: Run Performance Tests
+      run: |
+        echo "🚀 Running performance baseline tests..."
+        
+        # Run performance tests if available
+        if [ -f "package.json" ] && grep -q '"test:perf"' package.json; then
+          npm run test:perf
+        else
+          echo "No performance tests configured"
+        fi
+
+    - name: Build Performance Check
+      run: |
+        echo "⏱️ Measuring build performance..."
+        
+        START_TIME=$(date +%s)
+        npm run build || echo "No build script available"
+        END_TIME=$(date +%s)
+        
+        BUILD_TIME=$((END_TIME - START_TIME))
+        echo "Build completed in ${BUILD_TIME} seconds"
+        
+        # Log build time for tracking
+        echo "BUILD_TIME=${BUILD_TIME}" >> $GITHUB_ENV
+
+    - name: Memory Usage Check
+      run: |
+        echo "🧠 Checking memory usage patterns..."
+        
+        # Simple memory check during build
+        if command -v free &> /dev/null; then
+          free -h
+        elif command -v vm_stat &> /dev/null; then
+          vm_stat
+        fi
+
+  accessibility-check:
+    name: Accessibility Check
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+
+    - name: Install Dependencies
+      run: npm ci
+
+    - name: Build Project
+      run: |
+        if [ -f "package.json" ] && grep -q '"build"' package.json; then
+          npm run build
+        else
+          echo "No build script available, skipping accessibility check"
+          exit 0
+        fi
+
+    - name: Run Accessibility Tests
+      run: |
+        echo "♿ Running accessibility checks..."
+        
+        # Use axe-core if available
+        if npm list @axe-core/cli &> /dev/null; then
+          npx axe-core . --include .html --reporter v2
+        else
+          echo "axe-core not available, consider adding accessibility testing"
+        fi
+
+  quality-gates:
+    name: Quality Gates
+    runs-on: ubuntu-latest
+    needs: [code-quality, security-analysis, dependency-analysis, documentation-check]
+    if: always()
+    
+    steps:
+    - name: Check Job Results
+      run: |
+        echo "📊 Quality Gate Results:"
+        echo "Code Quality: ${{ needs.code-quality.result }}"
+        echo "Security Analysis: ${{ needs.security-analysis.result }}"
+        echo "Dependency Analysis: ${{ needs.dependency-analysis.result }}"
+        echo "Documentation Check: ${{ needs.documentation-check.result }}"
+        
+        # Fail if any critical checks failed
+        if [ "${{ needs.code-quality.result }}" = "failure" ] || [ "${{ needs.security-analysis.result }}" = "failure" ]; then
+          echo "❌ Critical quality gates failed"
+          exit 1
+        fi
+        
+        echo "✅ Quality gates passed"
+
+    - name: Post Quality Summary
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const results = {
+            'Code Quality': '${{ needs.code-quality.result }}',
+            'Security Analysis': '${{ needs.security-analysis.result }}',
+            'Dependency Analysis': '${{ needs.dependency-analysis.result }}',
+            'Documentation Check': '${{ needs.documentation-check.result }}'
+          };
+          
+          let summary = '## 📊 Quality Gate Results\n\n';
+          for (const [check, result] of Object.entries(results)) {
+            const icon = result === 'success' ? '✅' : result === 'failure' ? '❌' : '⚠️';
+            summary += `${icon} **${check}**: ${result}\n`;
+          }
+          
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: summary
+          });

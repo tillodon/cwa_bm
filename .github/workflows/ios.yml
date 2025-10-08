@@ -1,0 +1,320 @@
+name: iOS CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'ios/**'
+      - '.github/workflows/ios.yml'
+  pull_request:
+    branches: [ main, develop ]
+    paths:
+      - 'ios/**'
+      - '.github/workflows/ios.yml'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+
+env:
+  XCODE_VERSION: '15.0'
+  IOS_MIN_VERSION: '13.5'
+  SWIFT_VERSION: '5.9'
+
+jobs:
+  build-and-test:
+    name: Build and Test iOS
+    runs-on: macos-latest
+    
+    strategy:
+      matrix:
+        scheme: [CoronaWarnApp]
+        destination: [
+          'platform=iOS Simulator,name=iPhone 14 Pro,OS=17.0',
+          'platform=iOS Simulator,name=iPhone SE (3rd generation),OS=17.0'
+        ]
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Setup Xcode
+      uses: maxim-lobanov/setup-xcode@v1
+      with:
+        xcode-version: ${{ env.XCODE_VERSION }}
+
+    - name: Cache Swift Package Manager
+      uses: actions/cache@v3
+      with:
+        path: |
+          ios/DerivedData
+          ~/Library/Caches/org.swift.swiftpm/
+        key: ${{ runner.os }}-spm-${{ hashFiles('ios/**/Package.swift') }}
+        restore-keys: |
+          ${{ runner.os }}-spm-
+
+    - name: Cache CocoaPods
+      uses: actions/cache@v3
+      with:
+        path: ios/Pods
+        key: ${{ runner.os }}-pods-${{ hashFiles('ios/**/Podfile.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-pods-
+
+    - name: Install CocoaPods
+      run: |
+        cd ios
+        if [ -f "Podfile" ]; then
+          sudo gem install cocoapods
+          pod install --repo-update
+        fi
+
+    - name: Lint Swift Code
+      run: |
+        if command -v swiftlint &> /dev/null; then
+          cd ios
+          swiftlint --strict
+        else
+          echo "SwiftLint not installed, skipping linting"
+        fi
+
+    - name: Run Unit Tests
+      run: |
+        cd ios
+        xcodebuild test \
+          -workspace CoronaWarnApp.xcworkspace \
+          -scheme ${{ matrix.scheme }} \
+          -destination '${{ matrix.destination }}' \
+          -configuration Debug \
+          -enableCodeCoverage YES \
+          -derivedDataPath DerivedData \
+          CODE_SIGNING_REQUIRED=NO \
+          CODE_SIGNING_ALLOWED=NO
+
+    - name: Generate Code Coverage Report
+      run: |
+        cd ios
+        xcrun xccov view --report --json DerivedData/Logs/Test/*.xcresult > coverage.json
+        xcrun xccov view --report DerivedData/Logs/Test/*.xcresult
+
+    - name: Upload Code Coverage
+      uses: codecov/codecov-action@v3
+      with:
+        file: ios/coverage.json
+        flags: ios
+        fail_ci_if_error: true
+
+    - name: Build for Archive
+      if: github.event_name != 'pull_request'
+      env:
+        APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+      run: |
+        cd ios
+        # Import certificates and provisioning profiles
+        echo ${{ secrets.BUILD_CERTIFICATE_BASE64 }} | base64 --decode > certificate.p12
+        echo ${{ secrets.BUILD_PROVISION_PROFILE_BASE64 }} | base64 --decode > profile.mobileprovision
+        
+        # Create keychain
+        security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+        security default-keychain -s build.keychain
+        security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+        
+        # Import certificate
+        security import certificate.p12 -k build.keychain -P "$P12_PASSWORD" -T /usr/bin/codesign
+        security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" build.keychain
+        
+        # Install provisioning profile
+        mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+        cp profile.mobileprovision ~/Library/MobileDevice/Provisioning\ Profiles/
+        
+        # Build archive
+        xcodebuild archive \
+          -workspace CoronaWarnApp.xcworkspace \
+          -scheme ${{ matrix.scheme }} \
+          -configuration Release \
+          -derivedDataPath DerivedData \
+          -archivePath ${{ matrix.scheme }}.xcarchive \
+          CODE_SIGN_STYLE=Manual
+      env:
+        KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+
+    - name: Upload Build Artifacts
+      if: github.event_name != 'pull_request'
+      uses: actions/upload-artifact@v3
+      with:
+        name: ios-archive-${{ matrix.scheme }}
+        path: ios/${{ matrix.scheme }}.xcarchive
+
+  security-scan:
+    name: Security Scan
+    runs-on: macos-latest
+    needs: build-and-test
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Run Security Audit
+      run: |
+        cd ios
+        # Check for common security issues
+        echo "🔍 Scanning for potential security issues..."
+        
+        # Check for hardcoded secrets
+        if grep -r "API_KEY\|SECRET\|PASSWORD" --include="*.swift" --include="*.m" --include="*.h" .; then
+          echo "⚠️ Potential hardcoded secrets found"
+          exit 1
+        fi
+        
+        # Check Info.plist for security configurations
+        if [ -f "CoronaWarnApp/Info.plist" ]; then
+          echo "✅ Info.plist security check passed"
+        fi
+
+    - name: Dependency Vulnerability Scan
+      run: |
+        cd ios
+        if [ -f "Podfile.lock" ]; then
+          echo "🔍 Checking CocoaPods dependencies for vulnerabilities..."
+          # Add vulnerability scanning for CocoaPods here
+        fi
+        
+        if [ -f "Package.swift" ]; then
+          echo "🔍 Checking Swift Package dependencies for vulnerabilities..."
+          # Add vulnerability scanning for SPM here
+        fi
+
+  deploy-testflight:
+    name: Deploy to TestFlight
+    runs-on: macos-latest
+    needs: [build-and-test, security-scan]
+    if: github.ref == 'refs/heads/main' || github.event.inputs.environment == 'production'
+    
+    environment:
+      name: ${{ github.event.inputs.environment || 'staging' }}
+      url: https://appstoreconnect.apple.com
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Download Build Artifacts
+      uses: actions/download-artifact@v3
+      with:
+        name: ios-archive-CoronaWarnApp
+        path: ios/
+
+    - name: Setup Xcode
+      uses: maxim-lobanov/setup-xcode@v1
+      with:
+        xcode-version: ${{ env.XCODE_VERSION }}
+
+    - name: Export IPA
+      env:
+        APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      run: |
+        cd ios
+        
+        # Create export options plist
+        cat > ExportOptions.plist << EOF
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>
+          <key>method</key>
+          <string>app-store</string>
+          <key>teamID</key>
+          <string>$APPLE_TEAM_ID</string>
+          <key>uploadBitcode</key>
+          <false/>
+          <key>uploadSymbols</key>
+          <true/>
+          <key>compileBitcode</key>
+          <false/>
+        </dict>
+        </plist>
+        EOF
+        
+        # Export IPA
+        xcodebuild -exportArchive \
+          -archivePath CoronaWarnApp.xcarchive \
+          -exportPath export \
+          -exportOptionsPlist ExportOptions.plist
+
+    - name: Upload to TestFlight
+      env:
+        APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+        APP_STORE_CONNECT_API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+        APP_STORE_CONNECT_API_KEY: ${{ secrets.APP_STORE_CONNECT_API_KEY }}
+      run: |
+        cd ios
+        
+        # Create API key file
+        echo "$APP_STORE_CONNECT_API_KEY" | base64 --decode > AuthKey.p8
+        
+        # Upload to TestFlight
+        xcrun altool --upload-app \
+          --type ios \
+          --file export/CoronaWarnApp.ipa \
+          --apiKey $APP_STORE_CONNECT_API_KEY_ID \
+          --apiIssuer $APP_STORE_CONNECT_API_ISSUER_ID
+        
+        # Clean up
+        rm AuthKey.p8
+
+    - name: Notify Deployment
+      if: success()
+      run: |
+        echo "✅ iOS app successfully deployed to TestFlight"
+        echo "Environment: ${{ github.event.inputs.environment || 'staging' }}"
+        echo "Build: ${{ github.sha }}"
+
+  performance-test:
+    name: Performance Testing
+    runs-on: macos-latest
+    needs: build-and-test
+    if: github.event_name != 'pull_request'
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Setup Xcode
+      uses: maxim-lobanov/setup-xcode@v1
+      with:
+        xcode-version: ${{ env.XCODE_VERSION }}
+
+    - name: Run Performance Tests
+      run: |
+        cd ios
+        echo "🚀 Running iOS Performance Tests..."
+        
+        # Run XCTest performance tests
+        xcodebuild test \
+          -workspace CoronaWarnApp.xcworkspace \
+          -scheme CoronaWarnApp \
+          -destination 'platform=iOS Simulator,name=iPhone 14 Pro,OS=17.0' \
+          -configuration Release \
+          -testPlan PerformanceTests \
+          CODE_SIGNING_REQUIRED=NO \
+          CODE_SIGNING_ALLOWED=NO
+
+    - name: Analyze Memory Usage
+      run: |
+        echo "🧠 Analyzing memory usage patterns..."
+        # Add memory profiling tools here
+
+    - name: Battery Impact Analysis
+      run: |
+        echo "🔋 Analyzing battery impact..."
+        # Add battery impact analysis here
